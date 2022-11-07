@@ -27,7 +27,8 @@ class HyperAdam(opt.Optimizer):
             raise NotImplementedError('Sorry, too lazy.')
 
         # General hyperparams
-        self.lr = learning_rate
+        self.initial_learning_rate = learning_rate
+        self._learning_rate = self._build_learning_rate(learning_rate)
 
         # Adam hyperparams
         self.b1 = beta_1
@@ -36,15 +37,26 @@ class HyperAdam(opt.Optimizer):
         # Hypergrad hyperparams
         self.bh = beta_h
 
-        # Bleh
+        # Extras
         self.eps = epsilon
         self.amsgrad = amsgrad # Iff hypergrad is compatible (spoiler: doesn't seem likely)
 
     def build(self, var_list):
         super().build(var_list)
 
+        if hasattr(self, "_built") and self._built:
+            return
+
+        self._built = True
+
         self.m1 = []
         self.m2 = []
+        self.du = []
+
+        self.alpha = self.add_variable_from_reference(
+            model_variable=self.lr,
+            variable_name='alpha'
+        )
 
         for var in var_list:
             # self.add_variable adds a variable that I shape, while
@@ -55,15 +67,15 @@ class HyperAdam(opt.Optimizer):
             self.m2.append(
                 self.add_variable_from_reference(model_variable=var, variable_name='v')
             )
+            self.du.append(
+                self.add_variable_from_reference(model_variable=var, variable_name='du')
+            )
 
         if self.amsgrad:
             # Nothing to do here
             pass
 
-        self._built = True
-
     def update_step(self, gradient, variable):
-        lr = tf.cast(self.lr, variable.dtype)
         beta_1_power = tf.cast(self.b1, variable.dtype)
         beta_2_power = tf.cast(self.b2, variable.dtype)
 
@@ -76,7 +88,7 @@ class HyperAdam(opt.Optimizer):
         beta_2_power = tf.pow(beta_2_power, it)
 
         # This factors out the betas to create alpha_t = beta_stuff_t * alpha
-        alpha = lr * tf.sqrt(1 - beta_2_power) / (1 - beta_1_power)
+        beta_factor = tf.sqrt(1 - beta_2_power) / (1 - beta_1_power)
 
         if isinstance(gradient, tf.IndexedSlices):
             raise NotImplementedError('Sorry, too lazy.')
@@ -84,23 +96,28 @@ class HyperAdam(opt.Optimizer):
         var_key = self._var_key(variable)
         m = self.m1[self._index_dict[var_key]]
         v = self.m2[self._index_dict[var_key]]
+        du = self.du[self._index_dict[var_key]]
 
-        assert m == self.m1[self._index_dict[var_key]], 'ref to m broken'
-        assert v == self.m2[self._index_dict[var_key]], 'ref to v broken'
+        # Learning rate update step
+        # NOTE: du doesn't carry the minus signal
+        # so this is alpha = alpha + beta_h * (g * du)
+        # NOTE: Couldn't manage to use tf.tensordot because the rank of
+        # gradient wasn't available, but the line below is equivalent
+        self.alpha.assign_add(
+            self.bh * tf.reduce_sum(gradient * du)
+        )
 
-        # NOTE: May be slightly faster but involves more of the unstable (add/sub) ops:
-        # m += (g - m) * (1 - self.b1)
-        # v += (tf.square(g) - v) * (1 - self.b2)
-        m = self.b1 * m + (1 - self.b1) * gradient
-        v = self.b2 * v + (1 - self.b2) * tf.square(gradient)
+        m.assign_add((gradient - m) * (1 - self.b1))
+        v.assign_add((tf.square(gradient) - v) * (1 - self.b2))
 
-        # TODO: Check if these assignments broke the references to self.mq and self.m2 respectively
-        assert m == self.m1[self._index_dict[var_key]], 'ref to m broken'
-        assert v == self.m2[self._index_dict[var_key]], 'ref to v broken'
+        du.assign(
+            beta_factor * m / (tf.sqrt(v) + self.eps)
+        )
 
-        # Update rule when you factor out the betas and precalculate alpha_t (lr_t)
+        # NOTE: du doesn't carry the minus signal
+        # so this is var = var - alpha * du
         variable.assign_sub(
-            alpha * m / (tf.sqrt(v) + self.eps)
+            self.alpha * du
         )
 
     def get_config(self):
